@@ -2,6 +2,8 @@ package main
 
 import (
 	"bytes"
+	"context"
+	"encoding/json"
 	"flag"
 	"fmt"
 	"io"
@@ -12,35 +14,45 @@ import (
 	"strings"
 
 	"github.com/danmrichards/terraform-sandbox/providers/google"
+	"github.com/danmrichards/terraform-sandbox/providers/google/auth"
 	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/helper/logging"
 	"github.com/hashicorp/terraform/terraform"
+	"google.golang.org/api/compute/v1"
 )
 
 const (
 	tpl = `
-provider "google" {
-  credentials = "${file("service-account.json")}"
-  project     = "skyrocket-dev"
-  region      = "europe-west1"
+variable "machine_state" {
+  type        = "string"
+  description = "State in which the machine should be. Allowed values: RUNNING, TERMINATED"
 }
 
-variable "machine_state" {
+variable "project" {
   type = "string"
-  description = "State in which the machine should be. Allowed values: RUNNING, TERMINATED"
+  description = "GCP project to create the compute instance in"
+}
+
+variable "credentials_file" {
+  type = "string"
+  description = "Path to a GCP service account credentials file"
+}
+
+provider "google" {
+  credentials = "${file("${var.credentials_file}")}"
+  project     = "${var.project}"
+  region      = "europe-west1"
 }
 
 resource "google_compute_instance" "default" {
   name           = "terraform-test-instance"
-  machine_type   = "n1-standard-2"
-  zone           = "europe-west1-d"
+  machine_type   = "f1-micro"
+  zone           = "europe-west1-b"
   instance_state = "${var.machine_state}"
 
   boot_disk {
     initialize_params {
-      image = "projects/multiplay-images-dev/global/images/mp-dev-linux-40-p"
-      size  = 15
-      type  = "pd-ssd"
+      image = "debian-cloud/debian-9"
     }
   }
 
@@ -57,20 +69,29 @@ resource "google_compute_instance" "default" {
 )
 
 var (
-	destroy = flag.Bool("destroy", false, "destroy terraform managed infrastructure based on the plan")
-
-	machineState = flag.String("machinestate", "RUNNING", "State in which the machine should be. Allowed values: RUNNING, TERMINATED")
+	destroy                            bool
+	project, credentials, machineState string
 )
 
 func main() {
-	flag.Parse()
+	// The TF packages are bad and link the test flags ALL THE TIME so we have
+	// to use our own flag set.
+	if err := flags(); err != nil {
+		log.Fatal("could not parse flags: ", err)
+	}
 
 	// Set up TFs built in log writer.
 	// This takes it's log level from a TF_LOG env var.
 	// See: https://github.com/hashicorp/terraform/blob/master/helper/logging/logging.go
 	logging.SetOutput()
 
-	gcp := google.Provider()
+	// Create a google compute API client.
+	s, err := computeClient()
+	if err != nil {
+		log.Fatal("could not create google compute api client:", err)
+	}
+
+	gcp := google.Provider(s)
 	state, err := stateFromFile(sf)
 	if err != nil {
 		if os.IsNotExist(err) {
@@ -80,7 +101,7 @@ func main() {
 		}
 	}
 
-	ctx, err := tfContext(gcp, state, *destroy)
+	ctx, err := tfContext(gcp, state, destroy)
 	if err != nil {
 		log.Fatal("could not create context:", err)
 	}
@@ -89,15 +110,9 @@ func main() {
 		log.Fatal("could not refresh:", err)
 	}
 
-	p, err := ctx.Plan()
-	if err != nil {
+	if _, err = ctx.Plan(); err != nil {
 		log.Fatal("could not plan:", err)
 	}
-	fmt.Println("plan:", p)
-
-	//if _, err = ctx.Plan(); err != nil {
-	//	log.Fatal("could not plan:", err)
-	//}
 
 	state, err = ctx.Apply()
 	if err != nil {
@@ -109,6 +124,53 @@ func main() {
 	if err = writeStateToFile(sf, state); err != nil {
 		log.Fatal("write state to file:", err)
 	}
+
+	fmt.Println("apply complete")
+	fmt.Println("state:", state)
+}
+
+func flags() error {
+	f := flag.NewFlagSet(os.Args[0], flag.ExitOnError)
+	f.BoolVar(
+		&destroy,
+		"destroy",
+		false,
+		"destroy terraform managed infrastructure based on the plan",
+	)
+	f.StringVar(
+		&project,
+		"project",
+		"",
+		"GCP project to create the compute instance in",
+	)
+	f.StringVar(
+		&credentials,
+		"credentials",
+		"service-account.json",
+		"Path to a GCP service account credentials file",
+	)
+	f.StringVar(
+		&machineState,
+		"machinestate",
+		"RUNNING",
+		"State in which the machine should be. Allowed values: RUNNING, TERMINATED",
+	)
+
+	return f.Parse(os.Args[1:])
+}
+
+func computeClient() (*compute.Service, error) {
+	var creds auth.Credentials
+	sa, err := ioutil.ReadFile(credentials)
+	if err != nil {
+		return nil, err
+	}
+	if err = json.Unmarshal(sa, &creds); err != nil {
+		return nil, err
+	}
+
+	cfg := creds.JWTConfig([]string{compute.ComputeScope})
+	return compute.New(cfg.Client(context.Background()))
 }
 
 func stateFromFile(name string) (*terraform.State, error) {
@@ -138,7 +200,9 @@ func tfContext(p terraform.ResourceProvider, s *terraform.State, destroy bool) (
 		Destroy: destroy,
 		State:   s,
 		Variables: map[string]interface{}{
-			"machine_state": *machineState,
+			"project":          project,
+			"credentials_file": credentials,
+			"machine_state":    machineState,
 		},
 		Module: tfm,
 		ProviderResolver: terraform.ResourceProviderResolverFixed(map[string]terraform.ResourceProviderFactory{

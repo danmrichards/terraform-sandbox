@@ -3,13 +3,15 @@ package google
 import (
 	"errors"
 	"fmt"
-	"os"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform/helper/resource"
 	"github.com/hashicorp/terraform/helper/schema"
 	"github.com/hashicorp/terraform/helper/validation"
 	"github.com/hashicorp/terraform/terraform"
 	"github.com/terraform-providers/terraform-provider-google/google"
+	"google.golang.org/api/compute/v1"
 )
 
 // TODO: const enum for instance states.
@@ -19,7 +21,7 @@ type wrappedGoogleProvider struct {
 }
 
 // Provider returns a terraform.ResourceProvider.
-func Provider() terraform.ResourceProvider {
+func Provider(cs *compute.Service) terraform.ResourceProvider {
 	rp := google.Provider().(*schema.Provider)
 
 	// Get the resource so we can extend it.
@@ -37,10 +39,10 @@ func Provider() terraform.ResourceProvider {
 	}
 
 	// Wrap the resource reader so we can get the instance state.
-	gcr.Read = readInstanceState(gcr.Read)
+	gcr.Read = readInstanceState(cs, gcr.Read)
 
-	// TODO: Instead of wrapping "Apply" could we wrap the resource update func
-	// instead? The update func could then make the call to start/stop instance.
+	// Wrap the resource updater so we can set the instance state.
+	gcr.Update = updateInstanceState(cs, gcr.Update)
 
 	// Overwrite with our customised version of the resource.
 	rp.ResourcesMap["google_compute_instance"] = gcr
@@ -50,74 +52,153 @@ func Provider() terraform.ResourceProvider {
 	}
 }
 
-// Apply applies a diff to a specific resource and returns the new
-// resource state along with an error.
-//
-// If the resource state given has an empty ID, then a new resource
-// is expected to be created.
-func (w *wrappedGoogleProvider) Apply(
-	info *terraform.InstanceInfo,
-	s *terraform.InstanceState,
-	d *terraform.InstanceDiff) (*terraform.InstanceState, error) {
-
-	if err := applyInstanceState(d); err != nil {
-		return nil, err
-	}
-
-	fmt.Printf("info: %+v\n\n", info)
-	fmt.Printf("state: %+v\n\n", s)
-	fmt.Printf("diff: %+v\n\n", d)
-	os.Exit(1)
-
-	return w.ResourceProvider.Apply(info, s, d)
-}
-
-func readInstanceState(next schema.ReadFunc) schema.ReadFunc {
+// readInstanceState returns a read function for google compute instances that
+// will retrieve the state of an instance after the upstream rf has been
+// executed successfully.
+func readInstanceState(service *compute.Service, rf schema.ReadFunc) schema.ReadFunc {
 	return func(d *schema.ResourceData, meta interface{}) error {
-		if err := next(d, meta); err != nil {
+		// Run the upstream read.
+		if err := rf(d, meta); err != nil {
 			return err
 		}
 
-		fmt.Println(strings.Repeat("*", 80))
-		fmt.Println("this is where my state read call would go...if I had one!")
-		fmt.Println(strings.Repeat("*", 80))
+		config := meta.(*google.Config)
 
-		// TODO: Call Google SDK to get instance state
+		project, err := getProject(d, config)
+		if err != nil {
+			return err
+		}
+		zone, err := getZone(d, config)
+		if err != nil {
+			return err
+		}
+
+		// Get the instance info again (next already does this) so we can
+		// populate the instance_state (next will not do this).
+		_, state, err := getInstance(service, project, zone, d.Id())()
+		if err != nil {
+			// TODO: Handle not found errors.
+			return err
+		}
+
+		// Update the state. We're grouping states here because we just care
+		// if the machine is online, in any way, or not.
+		switch state {
+		case "PROVISIONING", "STAGING", "RUNNING":
+			if err = d.Set("instance_state", "RUNNING"); err != nil {
+				return err
+			}
+		default:
+			if err = d.Set("instance_state", "TERMINATED"); err != nil {
+				return err
+			}
+		}
 
 		return nil
 	}
 }
 
-func applyInstanceState(d *terraform.InstanceDiff) error {
-	isa, ok := d.GetAttribute("instance_state")
+// readInstanceState returns an update function for google compute instances
+// that will update the state of an instance before the upstream uf.
+func updateInstanceState(service *compute.Service, uf schema.UpdateFunc) schema.UpdateFunc {
+	return func(d *schema.ResourceData, meta interface{}) error {
+		// Only update the state if the diff indicates it has changed.
+		if d.HasChange("instance_state") {
+			config := meta.(*google.Config)
+
+			project, err := getProject(d, config)
+			if err != nil {
+				return err
+			}
+			zone, err := getZone(d, config)
+			if err != nil {
+				return err
+			}
+
+			switch d.Get("instance_state") {
+			case "RUNNING":
+				if err := startInstance(service, project, zone, d.Id()); err != nil {
+					return err
+				}
+			case "TERMINATED":
+				if err := stopInstance(service, project, zone, d.Id()); err != nil {
+					return err
+				}
+			}
+		}
+
+		// Run the upstream update.
+		return uf(d, meta)
+	}
+}
+
+func getInstance(service *compute.Service, project, zone, id string) resource.StateRefreshFunc {
+	return func() (result interface{}, state string, err error) {
+		i, err := service.Instances.Get(project, zone, id).Do()
+		if err != nil {
+			return nil, "", err
+		}
+
+		return i, i.Status, nil
+	}
+}
+
+func startInstance(service *compute.Service, project, zone, id string) error {
+	if _, err := service.Instances.Start(project, zone, id).Do(); err != nil {
+		return err
+	}
+
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"PROVISIONING", "STAGING", "TERMINATED"},
+		Target:     []string{"RUNNING"},
+		Refresh:    getInstance(service, project, zone, id),
+		Timeout:    10 * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 3 * time.Second,
+	}
+
+	_, err := stateConf.WaitForState()
+	return err
+}
+
+func stopInstance(service *compute.Service, project, zone, id string) error {
+	if _, err := service.Instances.Stop(project, zone, id).Do(); err != nil {
+		return err
+	}
+
+	stateConf := &resource.StateChangeConf{
+		Pending:    []string{"PROVISIONING", "STAGING", "RUNNING", "STOPPING"},
+		Target:     []string{"TERMINATED"},
+		Refresh:    getInstance(service, project, zone, id),
+		Timeout:    10 * time.Minute,
+		Delay:      10 * time.Second,
+		MinTimeout: 3 * time.Second,
+	}
+
+	_, err := stateConf.WaitForState()
+	return err
+}
+
+func getZone(d google.TerraformResourceData, config *google.Config) (string, error) {
+	res, ok := d.GetOk("zone")
 	if !ok {
-		return errors.New("missing instance_state attribute")
+		if config.Zone != "" {
+			return config.Zone, nil
+		}
+		return "", fmt.Errorf("cannot determine zone: set in this resource, or set provider-level zone")
 	}
 
-	// No state change required.
-	if isa.Old == isa.New {
-		return nil
+	parts := strings.Split(res.(string), "/")
+	return parts[len(parts)-1], nil
+}
+
+func getProject(d google.TerraformResourceData, config *google.Config) (string, error) {
+	res, ok := d.GetOk("project")
+	if ok {
+		return res.(string), nil
 	}
-
-	na, ok := d.GetAttribute("name")
-	if !ok {
-		return errors.New("missing name attribute")
+	if config.Project != "" {
+		return config.Project, nil
 	}
-	name := na.Old
-	if na.Old != na.New {
-		name = na.New
-	}
-
-	fmt.Println(strings.Repeat("*", 80))
-	fmt.Printf("instance %q: applying state change %q -> %q\n", name, isa.Old, isa.New)
-	fmt.Println("this is where my state change call would go...if I had one!")
-	fmt.Println(strings.Repeat("*", 80))
-
-	// TODO: Call Google SDK to stop/start instance.
-
-	// The standard TF provide does not support this resource, so get rid of it
-	// now that we're done with it.
-	d.DelAttribute("instance_state")
-
-	return nil
+	return "", errors.New("project: required field is not set")
 }
