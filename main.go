@@ -70,7 +70,7 @@ const (
 )
 
 var (
-	destroy                            bool
+	destroy, forceStateRefresh         bool
 	project, credentials, machineState string
 )
 
@@ -93,16 +93,31 @@ func main() {
 	}
 
 	gcp := google.Provider(s)
-	state, err := stateFromFile(sf)
+
+	// Parse the module JSON.
+	tfm, err := tfModule()
 	if err != nil {
-		if os.IsNotExist(err) {
-			state = terraform.NewState()
-		} else {
-			log.Fatal("could not read current state:", err)
+		log.Fatal("could not create terraform module:", err)
+	}
+
+	// Load the current state of the resource, either by manually reloading
+	// from the cloud provider or by using the state file on disk.
+	state := terraform.NewState()
+	if forceStateRefresh {
+		state, err = loadState(gcp, tfm)
+		if err != nil {
+			log.Fatal("could not load state:", err)
+		}
+	} else {
+		state, err = stateFromFile(sf)
+		if err != nil {
+			if !os.IsNotExist(err) {
+				log.Fatal("could not read current state:", err)
+			}
 		}
 	}
 
-	ctx, err := tfContext(gcp, state, destroy)
+	ctx, err := tfContext(gcp, state, tfm, destroy)
 	if err != nil {
 		log.Fatal("could not create context:", err)
 	}
@@ -135,6 +150,12 @@ func flags() error {
 		"destroy",
 		false,
 		"Destroy terraform managed infrastructure based on the plan",
+	)
+	f.BoolVar(
+		&forceStateRefresh,
+		"forcestaterefresh",
+		false,
+		"Force a load of state from the cloud provider instead of using the state file on disk",
 	)
 	f.StringVar(
 		&project,
@@ -172,6 +193,37 @@ func computeClient() (*compute.Service, error) {
 	return compute.New(cfg.Client(context.Background()))
 }
 
+func loadState(p terraform.ResourceProvider, m *module.Tree) (*terraform.State, error) {
+	ctxOpts := &terraform.ContextOpts{
+		State:  terraform.NewState(),
+		Module: m,
+		Variables: map[string]interface{}{
+			"project":          project,
+			"credentials_file": credentials,
+			"machine_state":    machineState,
+		},
+		ProviderResolver: terraform.ResourceProviderResolverFixed(
+			map[string]terraform.ResourceProviderFactory{
+				"google": terraform.ResourceProviderFactoryFixed(p),
+			},
+		),
+	}
+
+	ctx, err := terraform.NewContext(ctxOpts)
+	if err != nil {
+		return nil, err
+	}
+
+	return ctx.Import(&terraform.ImportOpts{
+		Targets: []*terraform.ImportTarget{
+			{
+				Addr: "google_compute_instance.default",
+				ID:   fmt.Sprintf("%s/europe-west1-b/terraform-test-instance", project),
+			},
+		},
+	})
+}
+
 func stateFromFile(name string) (*terraform.State, error) {
 	file, err := os.Open(name)
 	if err != nil {
@@ -188,13 +240,7 @@ func writeStateToFile(name string, state *terraform.State) error {
 	return ioutil.WriteFile(name, buf.Bytes(), 0644)
 }
 
-func tfContext(p terraform.ResourceProvider, s *terraform.State, destroy bool) (*terraform.Context, error) {
-	tfm, err := tfModule()
-	if err != nil {
-		return nil, err
-	}
-
-	// Create ContextOpts with the current state and variables to apply
+func tfContext(p terraform.ResourceProvider, s *terraform.State, m *module.Tree, destroy bool) (*terraform.Context, error) {
 	ctxOpts := &terraform.ContextOpts{
 		Destroy: destroy,
 		State:   s,
@@ -203,10 +249,12 @@ func tfContext(p terraform.ResourceProvider, s *terraform.State, destroy bool) (
 			"credentials_file": credentials,
 			"machine_state":    machineState,
 		},
-		Module: tfm,
-		ProviderResolver: terraform.ResourceProviderResolverFixed(map[string]terraform.ResourceProviderFactory{
-			"google": terraform.ResourceProviderFactoryFixed(p),
-		}),
+		Module: m,
+		ProviderResolver: terraform.ResourceProviderResolverFixed(
+			map[string]terraform.ResourceProviderFactory{
+				"google": terraform.ResourceProviderFactoryFixed(p),
+			},
+		),
 	}
 
 	ctx, err := terraform.NewContext(ctxOpts)

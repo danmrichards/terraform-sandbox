@@ -18,6 +18,8 @@ Usage of tfsandbox:
     	Path to a GCP service account credentials file (default "service-account.json")
   -destroy
     	Destroy terraform managed infrastructure based on the plan
+  -forcestaterefresh
+    	Force a load of state from the cloud provider instead of using the state file on disk
   -machinestate string
     	State in which the machine should be. Allowed values: RUNNING, TERMINATED (default "RUNNING")
   -project string
