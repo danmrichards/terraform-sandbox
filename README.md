@@ -1,5 +1,5 @@
 # Terraform Sandbox
-A proof-of-concept CLI which programmatically interacts with [terraform
+A proof-of-concept CLI which programmatically interacts with the [terraform
 golang package](https://github.com/hashicorp/terraform).
 
 The tool is capable of creating cloud VM, destroying a cloud VM and
