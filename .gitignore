@@ -81,4 +81,4 @@ Temporary Items
 .idea
 service-account.json
 sandbox.tfstate
-tfsandbox
+bin

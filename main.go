@@ -135,7 +135,7 @@ func flags() error {
 		&destroy,
 		"destroy",
 		false,
-		"destroy terraform managed infrastructure based on the plan",
+		"Destroy terraform managed infrastructure based on the plan",
 	)
 	f.StringVar(
 		&project,
