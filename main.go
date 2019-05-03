@@ -6,15 +6,13 @@ import (
 	"encoding/json"
 	"flag"
 	"fmt"
-	"io"
 	"io/ioutil"
 	"log"
 	"os"
-	"path/filepath"
-	"strings"
 
 	"github.com/danmrichards/terraform-sandbox/providers/google"
 	"github.com/danmrichards/terraform-sandbox/providers/google/auth"
+	"github.com/hashicorp/terraform/config"
 	"github.com/hashicorp/terraform/config/module"
 	"github.com/hashicorp/terraform/helper/logging"
 	"github.com/hashicorp/terraform/terraform"
@@ -22,47 +20,50 @@ import (
 )
 
 const (
-	tpl = `
-variable "machine_state" {
-  type        = "string"
-  description = "State in which the machine should be. Allowed values: RUNNING, TERMINATED"
-}
+	jsonTpl = `
+{
+	"variable": {
+		"machine_state": {
+			"type": "string",
+			"description": "State in which the machine should be. Allowed values: RUNNING, TERMINATED"
+		},
+		"project": {
+			"type": "string",
+			"description": "GCP project to create the compute instance in"
+		},
+		"credentials_file": {
+			"type": "string",
+			"description": "Path to a GCP service account credentials file"
+		}
+	},
 
-variable "project" {
-  type = "string"
-  description = "GCP project to create the compute instance in"
-}
+	"provider": {
+		"google": {
+			"credentials": "${file(\"${var.credentials_file}\")}",
+			"project": "${var.project}",
+			"region": "europe-west1"
+		}
+	},
 
-variable "credentials_file" {
-  type = "string"
-  description = "Path to a GCP service account credentials file"
-}
-
-provider "google" {
-  credentials = "${file("${var.credentials_file}")}"
-  project     = "${var.project}"
-  region      = "europe-west1"
-}
-
-resource "google_compute_instance" "default" {
-  name           = "terraform-test-instance"
-  machine_type   = "f1-micro"
-  zone           = "europe-west1-b"
-  instance_state = "${var.machine_state}"
-
-  boot_disk {
-    initialize_params {
-      image = "debian-cloud/debian-9"
-    }
-  }
-
-  network_interface {
-    network = "default"
-
-    access_config {
-      // Include this section to give the VM an external ip address
-    }
-  }
+	"resource": {
+		"google_compute_instance": {
+			"default": {
+				"name": "terraform-test-instance",
+				"machine_type": "f1-micro",
+				"zone": "europe-west1-b",
+				"instance_state": "${var.machine_state}",
+				"boot_disk": {
+					"initialize_params": {
+						"image": "debian-cloud/debian-9"
+					}
+				},
+				"network_interface": {
+					"network": "default",
+					"access_config": {}
+				}
+			}
+		}
+	}
 }`
 
 	sf = "sandbox.tfstate"
@@ -106,7 +107,7 @@ func main() {
 		log.Fatal("could not create context:", err)
 	}
 
-	if _, err := ctx.Refresh(); err != nil {
+	if _, err = ctx.Refresh(); err != nil {
 		log.Fatal("could not refresh:", err)
 	}
 
@@ -118,8 +119,6 @@ func main() {
 	if err != nil {
 		log.Fatal("could not apply:", err)
 	}
-
-	// TODO: How to wait for resource completion?
 
 	if err = writeStateToFile(sf, state); err != nil {
 		log.Fatal("write state to file:", err)
@@ -219,38 +218,18 @@ func tfContext(p terraform.ResourceProvider, s *terraform.State, destroy bool) (
 }
 
 func tfModule() (*module.Tree, error) {
-	cfgPath, err := ioutil.TempDir("", ".sandbox")
+	c, err := config.LoadJSON(json.RawMessage(jsonTpl))
 	if err != nil {
 		return nil, err
 	}
 
-	defer os.RemoveAll(cfgPath)
-
-	cfgFileName := filepath.Join(cfgPath, "main.tf")
-	cfgFile, err := os.Create(cfgFileName)
-	if err != nil {
-		return nil, err
-	}
-	defer cfgFile.Close()
-
-	if _, err = io.Copy(cfgFile, strings.NewReader(tpl)); err != nil {
-		return nil, err
-	}
-
-	mod, err := module.NewTreeModule("", cfgPath)
-	if err != nil {
-		return nil, err
-	}
-
-	s := module.NewStorage(filepath.Join(cfgPath, "modules"), nil)
-	s.Mode = module.GetModeNone
-
-	if err := mod.Load(s); err != nil {
+	mod := module.NewTree("", c)
+	if err = mod.Load(&module.Storage{Mode: module.GetModeNone}); err != nil {
 		return nil, fmt.Errorf("failed to load the modules. %s", err)
 	}
 
-	if err := mod.Validate().Err(); err != nil {
-		return nil, fmt.Errorf("failed Terraform code validation. %s", err)
+	if err = mod.Validate().Err(); err != nil {
+		return nil, fmt.Errorf("failed terraform code validation. %s", err)
 	}
 
 	return mod, nil
