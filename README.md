@@ -12,6 +12,9 @@ $ make
 ```
 
 ## Usage
+The CLI will manage a virtual machine with the name `terraform-test-instance` in
+the Google Cloud project you supply via the command line flags. You will also need
+to supply a service account file with appropriate permissions to create VMs.
 ```bash
 Usage of tfsandbox:
   -credentials string
